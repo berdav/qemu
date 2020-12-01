@@ -7,6 +7,9 @@
  *  Clement Deschamps <clement.deschamps@antfield.fr>
  *  Luc Michel <luc.michel@antfield.fr>
  *
+ * GPIO External support
+ *  Davide Berardi <berardi.dav@gmail.com>
+ *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
  */
@@ -20,6 +23,7 @@
 #include "migration/vmstate.h"
 #include "hw/sd/sd.h"
 #include "hw/gpio/bcm2835_gpio.h"
+#include "hw/intc/bcm2835_ic.h"
 #include "hw/irq.h"
 
 #define GPFSEL0   0x00
@@ -110,6 +114,29 @@ static int gpfsel_is_out(BCM2835GpioState *s, int index)
     return 0;
 }
 
+static inline int get_bit_2_u32(const uint32_t idx,
+                                const uint32_t v1, const uint32_t v2)
+{
+    uint64_t v = v1 | ((uint64_t)v2) << 32;
+    return !!(v & (1 << idx));
+}
+
+static int ren_detect(BCM2835GpioState *s, int index)
+{
+    if (index >= 0 && index < 54) {
+        return get_bit_2_u32(index, s->ren0, s->ren1);
+    }
+    return 0;
+}
+
+static int fen_detect(BCM2835GpioState *s, int index)
+{
+    if (index >= 0 && index < 54) {
+        return get_bit_2_u32(index, s->fen0, s->fen1);
+    }
+    return 0;
+}
+
 static void gpset(BCM2835GpioState *s,
         uint32_t val, uint8_t start, uint8_t count, uint32_t *lev)
 {
@@ -120,6 +147,20 @@ static void gpset(BCM2835GpioState *s,
     for (i = 0; i < count; i++) {
         if ((changes & cur) && (gpfsel_is_out(s, start + i))) {
             qemu_set_irq(s->out[start + i], 1);
+        } else if ((changes & cur) && ren_detect(s, start + i)) {
+            /* If this is an input and must check rising edge */
+            int irqline = 0;
+            if (i > 27)
+                irqline = 1;
+            if (i > 45)
+                irqline = 2;
+
+            /* Set the bit in the events */
+            if (i < 32)
+                s->eds0 |= cur;
+            else
+                s->eds1 |= cur;
+            qemu_set_irq(s->irq[irqline], 1);
         }
         cur <<= 1;
     }
@@ -137,11 +178,48 @@ static void gpclr(BCM2835GpioState *s,
     for (i = 0; i < count; i++) {
         if ((changes & cur) && (gpfsel_is_out(s, start + i))) {
             qemu_set_irq(s->out[start + i], 0);
+        } else if ((changes & cur) && fen_detect(s, start + i)) {
+            /* If this is an input we must check falling edge */
+            int irqline = 0;
+            if (i > 27)
+                irqline = 1;
+            if (i > 45)
+              irqline = 2;
+
+            qemu_set_irq(s->irq[irqline], 1);
         }
         cur <<= 1;
     }
 
     *lev &= ~val;
+}
+
+static int gpio_from_value(uint64_t value, int bank)
+{
+    int i;
+    for (i = 0 ; i < 32; ++i)
+        if (value & (1 << i))
+           return i + (32 * bank);
+    return 0;
+}
+
+static void eds_clear(BCM2835GpioState *s, uint64_t value, int bank)
+{
+    int gpio = 0;
+    int irqline = 0;
+    if (bank) {
+        s->eds0 &= ~value;
+    } else {
+        s->eds1 &= (~value & 0x3f);
+    }
+    gpio = gpio_from_value(value, bank);
+
+    if (gpio > 27)
+       irqline = 1;
+    if (gpio > 45)
+       irqline = 2;
+
+    qemu_set_irq(s->irq[irqline], 0);
 }
 
 static uint64_t bcm2835_gpio_read(void *opaque, hwaddr offset,
@@ -170,11 +248,17 @@ static uint64_t bcm2835_gpio_read(void *opaque, hwaddr offset,
     case GPLEV1:
         return s->lev1;
     case GPEDS0:
+        return s->eds0;
     case GPEDS1:
+        return s->eds1;
     case GPREN0:
+        return s->ren0;
     case GPREN1:
+        return s->ren1;
     case GPFEN0:
+        return s->fen0;
     case GPFEN1:
+        return s->fen1;
     case GPHEN0:
     case GPHEN1:
     case GPLEN0:
@@ -228,11 +312,23 @@ static void bcm2835_gpio_write(void *opaque, hwaddr offset,
         /* Read Only */
         break;
     case GPEDS0:
+        eds_clear(s, value, 0);
+        break;
     case GPEDS1:
+        eds_clear(s, value, 1);
+        break;
     case GPREN0:
+        s->ren0 = value;
+        break;
     case GPREN1:
+        s->ren1 = value;
+        break;
     case GPFEN0:
+        s->fen0 = value;
+        break;
     case GPFEN1:
+        s->fen1 = value;
+        break;
     case GPHEN0:
     case GPHEN1:
     case GPLEN0:
@@ -310,6 +406,7 @@ static void bcm2835_gpio_init(Object *obj)
 
 static void bcm2835_gpio_realize(DeviceState *dev, Error **errp)
 {
+    int i;
     BCM2835GpioState *s = BCM2835_GPIO(dev);
     Object *obj;
 
@@ -318,6 +415,14 @@ static void bcm2835_gpio_realize(DeviceState *dev, Error **errp)
 
     obj = object_property_get_link(OBJECT(dev), "sdbus-sdhost", &error_abort);
     s->sdbus_sdhost = SD_BUS(obj);
+
+    obj = object_property_get_link(OBJECT(dev), "ic", &error_abort);
+    s->ic = BCM2835_IC(obj);
+
+    for (i = 0 ; i < 3; ++i) {
+        s->irq[i] = qdev_get_gpio_in_named(DEVICE(obj),
+                                           BCM2835_IC_GPU_IRQ, i + 49);
+    }
 }
 
 static void bcm2835_gpio_class_init(ObjectClass *klass, void *data)

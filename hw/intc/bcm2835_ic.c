@@ -13,8 +13,8 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/intc/bcm2835_ic.h"
 #include "hw/irq.h"
+#include "hw/intc/bcm2835_ic.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -57,7 +57,6 @@ static void bcm2835_ic_update(BCM2835ICState *s)
 static void bcm2835_ic_set_gpu_irq(void *opaque, int irq, int level)
 {
     BCM2835ICState *s = opaque;
-
     assert(irq >= 0 && irq < 64);
     trace_bcm2835_ic_set_gpu_irq(irq, level);
     s->gpu_irq_level = deposit64(s->gpu_irq_level, irq, 1, level != 0);
@@ -67,7 +66,6 @@ static void bcm2835_ic_set_gpu_irq(void *opaque, int irq, int level)
 static void bcm2835_ic_set_arm_irq(void *opaque, int irq, int level)
 {
     BCM2835ICState *s = opaque;
-
     assert(irq >= 0 && irq < 8);
     trace_bcm2835_ic_set_cpu_irq(irq, level);
     s->arm_irq_level = deposit32(s->arm_irq_level, irq, 1, level != 0);
